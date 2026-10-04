@@ -1,0 +1,168 @@
+-- GlowUp Club. Run once in Supabase SQL Editor. No customer table is public.
+begin;
+create table if not exists public.glow_users (
+ id bigint primary key, name text not null default '', username text not null default '',
+ joined_at bigint not null default extract(epoch from now())::bigint,
+ trial_started bigint, trial_seconds integer not null default 300,
+ access_until bigint not null default 0, lifetime boolean not null default false,
+ blocked boolean not null default false, managed boolean not null default false,
+ flow jsonb not null default '{}'::jsonb
+);
+create table if not exists public.glow_orders (
+ id text primary key, user_id bigint not null references public.glow_users(id), plan text not null,
+ stars integer not null check(stars>0), days integer check(days>0), promo text,
+ created_at bigint not null default extract(epoch from now())::bigint, state text not null default 'new'
+);
+create table if not exists public.glow_payments (
+ charge text primary key, order_id text not null unique references public.glow_orders(id), user_id bigint not null,
+ stars integer not null, created_at bigint not null default extract(epoch from now())::bigint,
+ refunded boolean not null default false
+);
+alter table public.glow_payments add column if not exists refund_pending boolean not null default false;
+create table if not exists public.glow_grants (
+ id text primary key, user_id bigint not null references public.glow_users(id), seconds bigint,
+ created_at bigint not null default extract(epoch from now())::bigint, revoked boolean not null default false,
+ source text not null, actor bigint
+);
+create table if not exists public.glow_invites (
+ link text primary key, user_id bigint not null references public.glow_users(id), kind text not null,
+ expires bigint not null, consumed boolean not null default false
+);
+create table if not exists public.glow_promos (
+ code text primary key, percent integer not null check(percent between 1 and 90),
+ max_uses integer not null check(max_uses>0), used integer not null default 0, enabled boolean not null default true
+);
+create table if not exists public.glow_promo_uses (
+ code text not null references public.glow_promos(code), user_id bigint not null,
+ primary key(code,user_id)
+);
+create table if not exists public.glow_tickets (
+ id bigint generated always as identity primary key, user_id bigint not null references public.glow_users(id),
+ text text not null, state text not null default 'open', created_at bigint not null default extract(epoch from now())::bigint
+);
+create table if not exists public.glow_ticket_messages (
+ id text primary key, ticket_id bigint not null references public.glow_tickets(id), actor bigint not null,
+ text text not null, created_at bigint not null default extract(epoch from now())::bigint
+);
+create table if not exists public.glow_campaigns (
+ id text primary key, actor bigint not null, text text not null, state text not null default 'draft',
+ cursor bigint not null default 0, sent integer not null default 0, failed integer not null default 0,
+ created_at bigint not null default extract(epoch from now())::bigint
+);
+create table if not exists public.glow_audit (
+ id bigint generated always as identity primary key, actor bigint, action text not null, details jsonb not null,
+ created_at bigint not null default extract(epoch from now())::bigint
+);
+create table if not exists public.glow_runtime (key text primary key, value jsonb not null);
+create index if not exists glow_users_expiry on public.glow_users(access_until) where managed;
+create index if not exists glow_tickets_open on public.glow_tickets(state,id);
+create index if not exists glow_grants_user on public.glow_grants(user_id,created_at,id);
+
+create or replace function public.glow_recalculate(uid bigint) returns void language plpgsql set search_path=public as $$
+declare g record; expiry bigint:=0; forever boolean:=false;
+begin
+ for g in select * from glow_grants where user_id=uid and not revoked order by created_at,id loop
+  if g.seconds is null then forever:=true;
+  elsif not forever then expiry:=greatest(expiry,g.created_at)+g.seconds; end if;
+ end loop;
+ update glow_users set access_until=expiry,lifetime=forever where id=uid;
+end $$;
+
+-- Atomic operations. Only service_role may execute; never expose its key to the user interface.
+create or replace function public.glow_action(action text,args jsonb) returns jsonb language plpgsql set search_path=public as $$
+declare uid bigint:=(args->>'uid')::bigint; actor bigint:=(args->>'actor')::bigint;
+ ts bigint:=extract(epoch from now())::bigint; o glow_orders; p glow_promos; u glow_users;
+ tid bigint; existing glow_payments; kind text; linkrow glow_invites; answer jsonb;
+begin
+ if uid is not null then perform pg_advisory_xact_lock(uid); end if;
+ if action='payment' then
+  select * into o from glow_orders where id=args->>'order' for update;
+  if o.id is null or o.user_id<>uid or o.stars<>(args->>'stars')::integer or args->>'currency'<>'XTR' then raise exception 'PAYMENT_MISMATCH'; end if;
+  select * into existing from glow_payments where charge=args->>'charge';
+  if existing.charge is not null then
+   if existing.order_id<>o.id then raise exception 'CHARGE_REUSED'; end if;
+   return jsonb_build_object('duplicate',true);
+  end if;
+  if o.state='paid' then raise exception 'ORDER_ALREADY_PAID'; end if;
+  insert into glow_payments(charge,order_id,user_id,stars) values(args->>'charge',o.id,uid,o.stars);
+  insert into glow_grants(id,user_id,seconds,source) values('pay:'||(args->>'charge'),uid,o.days::bigint*86400,'payment');
+  update glow_orders set state='paid' where id=o.id;
+  perform glow_recalculate(uid);
+ elsif action='refund' then
+  select * into existing from glow_payments where charge=args->>'charge' for update;
+  if existing.charge is null then raise exception 'PAYMENT_NOT_FOUND'; end if;
+  uid:=existing.user_id; perform pg_advisory_xact_lock(uid);
+  update glow_payments set refunded=true where charge=existing.charge;
+  update glow_grants set revoked=true where id='pay:'||existing.charge;
+  perform glow_recalculate(uid);
+ elsif action='grant' then
+  insert into glow_users(id) values(uid) on conflict do nothing;
+  insert into glow_grants(id,user_id,seconds,source,actor) values(args->>'id',uid,(args->>'days')::bigint*86400,'admin',actor) on conflict do nothing;
+  update glow_users set blocked=false where id=uid;
+  perform glow_recalculate(uid);
+ elsif action='revoke' then
+  update glow_grants set revoked=true where user_id=uid;
+  update glow_users set trial_started=coalesce(trial_started,ts),trial_seconds=0 where id=uid;
+  perform glow_recalculate(uid);
+ elsif action='block' then
+  update glow_users set blocked=(args->>'blocked')::boolean where id=uid;
+ elsif action='joined' then
+  select * into u from glow_users where id=uid for update;
+  select * into linkrow from glow_invites where link=args->>'link' and user_id=uid;
+  if linkrow.link is null then raise exception 'INVITE_NOT_FOUND'; end if;
+  if linkrow.kind='trial' and u.trial_started is null then
+   update glow_users set trial_started=ts where id=uid;
+  end if;
+  update glow_users set managed=true where id=uid;
+  update glow_invites set consumed=true where link=linkrow.link;
+ elsif action='promo_order' then
+  select * into p from glow_promos where code=upper(args->>'code') for update;
+  if p.code is null or not p.enabled or p.used>=p.max_uses or exists(select 1 from glow_promo_uses where code=p.code and user_id=uid) then raise exception 'PROMO_UNAVAILABLE'; end if;
+  -- A use is reserved when the discounted invoice is created. This prevents overselling.
+  insert into glow_promo_uses values(p.code,uid);
+  update glow_promos set used=used+1 where code=p.code;
+  insert into glow_orders(id,user_id,plan,stars,days,promo) values(args->>'id',uid,args->>'plan',greatest(1,ceil((args->>'stars')::numeric*(100-p.percent)/100)::integer),(args->>'days')::integer,p.code);
+  select to_jsonb(x) into answer from glow_orders x where id=args->>'id';
+  return answer;
+ elsif action='ticket' then
+  -- Stable id supplied by the bot: duplicate update does not create a second ticket.
+  if exists(select 1 from glow_ticket_messages where id=args->>'id') then return '{}'::jsonb; end if;
+  insert into glow_tickets(user_id,text) values(uid,args->>'text') returning id into tid;
+  insert into glow_ticket_messages(id,ticket_id,actor,text) values(args->>'id',tid,uid,args->>'text');
+  return jsonb_build_object('id',tid);
+ elsif action='expired' then
+  return coalesce((select jsonb_agg(x) from (select * from glow_users where managed and (blocked or (not lifetime and access_until<=ts and coalesce(trial_started+trial_seconds,0)<=ts)) order by id limit 100) x),'[]'::jsonb);
+ elsif action='stats' then
+  return jsonb_build_object('users',(select count(*) from glow_users),
+   'active',(select count(*) from glow_users where not blocked and (lifetime or access_until>ts)),
+   'trials',(select count(*) from glow_users where trial_started+trial_seconds>ts and not blocked),
+   'stars',(select coalesce(sum(stars),0) from glow_payments where not refunded),
+   'payments',(select count(*) from glow_payments where not refunded),
+   'tickets',(select count(*) from glow_tickets where state='open'));
+ else raise exception 'UNKNOWN_ACTION'; end if;
+ insert into glow_audit(actor,action,details) values(actor,action,args- 'charge');
+ return jsonb_build_object('ok',true);
+end $$;
+
+-- One active poller per project. A crashed process releases its lease within 90 seconds.
+create or replace function public.glow_lease(owner text) returns boolean language plpgsql set search_path=public as $$
+declare holder jsonb;ts bigint:=extract(epoch from now())::bigint;
+begin
+ insert into glow_runtime values('lease','{}') on conflict do nothing;
+ select value into holder from glow_runtime where key='lease' for update;
+ if coalesce((holder->>'expires')::bigint,0)>ts and holder->>'owner'<>owner then return false; end if;
+ update glow_runtime set value=jsonb_build_object('owner',owner,'expires',ts+90) where key='lease';
+ return true;
+end $$;
+
+do $$ declare t text; begin
+ foreach t in array array['glow_users','glow_orders','glow_payments','glow_grants','glow_invites','glow_promos','glow_promo_uses','glow_tickets','glow_ticket_messages','glow_campaigns','glow_audit','glow_runtime'] loop
+  execute format('alter table public.%I enable row level security',t);
+  execute format('revoke all on public.%I from anon, authenticated',t);
+  execute format('grant all on public.%I to service_role',t);
+ end loop;
+end $$;
+grant usage,select on sequence public.glow_tickets_id_seq,public.glow_audit_id_seq to service_role;
+revoke all on function public.glow_recalculate(bigint),public.glow_action(text,jsonb),public.glow_lease(text) from public,anon,authenticated;
+grant execute on function public.glow_recalculate(bigint),public.glow_action(text,jsonb),public.glow_lease(text) to service_role;
+commit;

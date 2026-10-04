@@ -1,0 +1,4 @@
+# Replace the domain with yours. Run Caddy on the same host as checkout.py.
+pay.example.com {
+ reverse_proxy 127.0.0.1:8080
+}

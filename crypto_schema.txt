@@ -1,0 +1,99 @@
+-- Run after schema.sql. Dedicated website checkout; no crypto purchase button inside Telegram.
+begin;
+create table if not exists public.glow_web_sessions (
+ id text primary key, challenge text unique not null, user_id bigint references public.glow_users(id),
+ expires bigint not null, created_at bigint not null default extract(epoch from now())::bigint
+);
+create table if not exists public.glow_crypto_orders (
+ id text primary key, user_id bigint not null references public.glow_users(id), plan text not null,
+ days integer check(days>0), amount bigint not null check(amount>0), received bigint not null default 0,
+ recipient text not null, master text not null, state text not null default 'pending',
+ created_at bigint not null default extract(epoch from now())::bigint, expires bigint not null,
+ credited boolean not null default false
+);
+create table if not exists public.glow_crypto_receipts (
+ id text primary key, event_id text not null, order_id text references public.glow_crypto_orders(id),
+ amount bigint not null check(amount>0), recipient text not null, master text not null, sender text not null,
+ chain_time bigint not null, credited_order text references public.glow_crypto_orders(id),
+ created_at bigint not null default extract(epoch from now())::bigint
+);
+create index if not exists glow_crypto_orders_user on public.glow_crypto_orders(user_id,created_at);
+create index if not exists glow_crypto_receipts_order on public.glow_crypto_receipts(order_id);
+
+create or replace function public.glow_crypto_action(action text,args jsonb) returns jsonb language plpgsql set search_path=public as $$
+declare ts bigint:=extract(epoch from now())::bigint; uid bigint:=(args->>'uid')::bigint;
+ o glow_crypto_orders; r glow_crypto_receipts; s glow_web_sessions; target text; total bigint; eligible bigint; manual boolean:=false;
+begin
+ if action='link' then
+  select * into s from glow_web_sessions where challenge=args->>'challenge' for update;
+  if s.id is null or s.expires<ts then raise exception 'LOGIN_EXPIRED'; end if;
+  if s.user_id is not null and s.user_id<>uid then raise exception 'LOGIN_ALREADY_BOUND'; end if;
+  update glow_web_sessions set user_id=uid,expires=ts+3600 where id=s.id;
+  return jsonb_build_object('ok',true);
+ end if;
+ if action='deposit' then
+  target:=args->>'order';
+  select * into o from glow_crypto_orders where id=target for update;
+  if o.id is not null and (o.recipient<>args->>'recipient' or o.master<>args->>'master') then raise exception 'DEPOSIT_MISMATCH'; end if;
+  if exists(select 1 from glow_crypto_receipts where id=args->>'id') then return jsonb_build_object('duplicate',true); end if;
+  insert into glow_crypto_receipts(id,event_id,order_id,amount,recipient,master,sender,chain_time)
+   values(args->>'id',args->>'event_id',o.id,(args->>'amount')::bigint,args->>'recipient',args->>'master',args->>'sender',(args->>'chain_time')::bigint);
+  if o.id is null then return jsonb_build_object('unmatched',true); end if;
+ elsif action='assign' then
+  target:=args->>'order';select * into o from glow_crypto_orders where id=target for update;
+  select * into r from glow_crypto_receipts where id=args->>'receipt' for update;
+  if o.id is null or r.id is null or r.credited_order is not null or r.order_id is not null then raise exception 'RECEIPT_UNAVAILABLE'; end if;
+  if o.recipient<>r.recipient or o.master<>r.master then raise exception 'DEPOSIT_MISMATCH'; end if;
+  update glow_crypto_receipts set order_id=o.id where id=r.id;
+  manual:=true;
+ elsif action='approve' then
+  target:=args->>'order';select * into o from glow_crypto_orders where id=target for update;
+  if o.id is null then raise exception 'ORDER_NOT_FOUND'; end if;
+  manual:=true;
+ elsif action='refund_record' then
+  select * into o from glow_crypto_orders where id=args->>'order' for update;
+  if o.id is null or not o.credited then raise exception 'PAID_ORDER_NOT_FOUND'; end if;
+  if coalesce(args->>'tx','')='' then raise exception 'REFUND_HASH_REQUIRED'; end if;
+  -- Operator has already sent the refund from their own wallet. This records it, it does not move funds.
+  perform pg_advisory_xact_lock(o.user_id);
+  update glow_crypto_orders set state='refunded' where id=o.id;
+  update glow_grants set revoked=true where id='crypto:'||o.id;
+  perform pg_advisory_xact_lock(o.user_id);perform glow_recalculate(o.user_id);
+  insert into glow_audit(actor,action,details) values((args->>'actor')::bigint,'crypto_refund_recorded',args);
+  return jsonb_build_object('ok',true);
+ else raise exception 'UNKNOWN_CRYPTO_ACTION'; end if;
+ select coalesce(sum(amount),0),coalesce(sum(amount) filter(where chain_time between o.created_at-30 and o.expires),0)
+  into total,eligible from glow_crypto_receipts where order_id=o.id;
+ update glow_crypto_orders set received=total where id=o.id;
+ if o.credited then
+  -- Further deposits remain visible but never extend access a second time.
+  return jsonb_build_object('duplicate',true,'order',o.id);
+ end if;
+ if manual and total<o.amount then raise exception 'UNDERPAID'; end if;
+ if (manual and total>=o.amount) or (not manual and eligible>=o.amount) then
+  if exists(select 1 from glow_users where id=o.user_id and blocked) then
+   update glow_crypto_orders set state='review' where id=o.id;
+   return jsonb_build_object('review',true,'order',o.id);
+  end if;
+  perform pg_advisory_xact_lock(o.user_id);
+  insert into glow_grants(id,user_id,seconds,source,actor) values('crypto:'||o.id,o.user_id,o.days::bigint*86400,'crypto',(args->>'actor')::bigint) on conflict do nothing;
+  perform glow_recalculate(o.user_id);
+  update glow_crypto_orders set state='paid',credited=true where id=o.id;
+  update glow_crypto_receipts set credited_order=o.id where order_id=o.id;
+  insert into glow_audit(actor,action,details) values((args->>'actor')::bigint,'crypto_credited',jsonb_build_object('order',o.id,'manual',manual));
+  return jsonb_build_object('paid',true,'uid',o.user_id,'order',o.id);
+ end if;
+ update glow_crypto_orders set state=case when ts>o.expires then 'review' else 'underpaid' end where id=o.id;
+ return jsonb_build_object('review',ts>o.expires,'underpaid',total<o.amount,'order',o.id);
+end $$;
+
+do $$ declare t text; begin
+ foreach t in array array['glow_web_sessions','glow_crypto_orders','glow_crypto_receipts'] loop
+  execute format('alter table public.%I enable row level security',t);
+  execute format('revoke all on public.%I from public,anon,authenticated',t);
+  execute format('grant all on public.%I to service_role',t);
+ end loop;
+end $$;
+revoke all on function public.glow_crypto_action(text,jsonb) from public,anon,authenticated;
+grant execute on function public.glow_crypto_action(text,jsonb) to service_role;
+commit;
